@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: frontend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://git-codecommit.ap-south-1.amazonaws.com/v1/repos/tenderflow-infra
+    targetRevision: main
+    path: charts/node-service
+    helm:
+      releaseName: frontend
+      valueFiles:
+        - ../../envs/dev/frontend/values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tenderflow
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
