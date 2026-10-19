@@ -1,0 +1,12 @@
+image:
+  repository: 935262984400.dkr.ecr.ap-south-1.amazonaws.com/tenderflow/quotation-service
+  tag: manual-1          # the pipeline will bump this later
+
+port: 4003
+
+secretEnv:
+  - MONGO_URI
+  - JWT_SECRET
+
+# DocumentDB CA is baked into the image at /app/certs (see Dockerfile), no mount needed
+docdbCA: false

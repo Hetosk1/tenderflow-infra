@@ -1,0 +1,27 @@
+# Defaults. Each service overrides these in envs/<env>/<service>/values.yaml
+image:
+  repository: ""
+  tag: ""
+
+replicas: 1
+port: 3000
+# liveness = process is alive, readiness = dependencies (DB) are connected
+livenessPath: /healthz
+readinessPath: /readyz
+
+# Plain env vars (PORT is set automatically from .port)
+env: {}
+
+# Keys to pull from the shared Secret (created by External Secrets)
+secretName: tenderflow-secrets
+secretEnv: []
+
+# Mount the Amazon DocumentDB CA bundle at /certs/global-bundle.pem
+docdbCA: false
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 256Mi

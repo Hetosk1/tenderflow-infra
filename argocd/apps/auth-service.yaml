@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: auth-service
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://git-codecommit.ap-south-1.amazonaws.com/v1/repos/tenderflow-infra
+    targetRevision: main
+    path: charts/node-service
+    helm:
+      releaseName: auth-service
+      valueFiles:
+        - ../../envs/dev/auth-service/values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tenderflow
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

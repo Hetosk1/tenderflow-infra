@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# Terraform
+# ---------------------------------------------------------------------------
+# Provider/module downloads (re-created by `terraform init`)
+**/.terraform/*
+
+# State: holds DB passwords, JWT secret, etc. bootstrap/ state is local and
+# must be kept safe OUTSIDE git; platform/ state lives in S3.
+*.tfstate
+*.tfstate.*
+
+# Variable files often hold secrets. Commit an example instead.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Plans can contain sensitive values
+*.tfplan
+tfplan
+
+# Local overrides and crash logs
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored (pins provider versions)
+
+# ---------------------------------------------------------------------------
+# Helm
+# ---------------------------------------------------------------------------
+charts/*/charts/
+charts/*/*.tgz
+
+# ---------------------------------------------------------------------------
+# Secrets / credentials (they belong in SSM, never in git)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+kubeconfig
+*.kubeconfig
+
+# ---------------------------------------------------------------------------
+# OS / editor / misc
+# ---------------------------------------------------------------------------
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.zip
+*.log
