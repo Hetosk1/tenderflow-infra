@@ -119,9 +119,11 @@ resource "random_password" "jwt" {
 }
 
 locals {
-  # tlsCAFile path is baked into each service image (see the service Dockerfiles)
+  # tlsCAFile path is baked into each service image (see the service Dockerfiles).
+  # authMechanism=SCRAM-SHA-1: mongodb driver 7.x defaults to SCRAM-SHA-256, which
+  # DocumentDB rejects with "Unsupported mechanism [ -301 ]".
   mongo_uri = format(
-    "mongodb://%s:%s@%s:%d/tenderflow?tls=true&tlsCAFile=/app/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false",
+    "mongodb://%s:%s@%s:%d/tenderflow?tls=true&tlsCAFile=/app/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false&authMechanism=SCRAM-SHA-1",
     aws_docdb_cluster.this.master_username,
     random_password.docdb.result,
     aws_docdb_cluster.this.endpoint,
