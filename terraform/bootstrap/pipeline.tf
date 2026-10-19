@@ -235,6 +235,10 @@ resource "aws_codepipeline" "this" {
   pipeline_type  = "V2"
   execution_mode = "QUEUED" # pushes run one after another instead of superseding each other
 
+  # A new pipeline runs immediately on creation; without this it can start before
+  # its role has permissions and fail with "not authorized to perform codecommit:GetBranch"
+  depends_on = [aws_iam_role_policy.codepipeline]
+
   artifact_store {
     type     = "S3"
     location = aws_s3_bucket.pipeline_artifacts.bucket
