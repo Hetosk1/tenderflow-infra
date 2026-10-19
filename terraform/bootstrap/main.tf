@@ -3,7 +3,7 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  services = ["frontend", "backend", "auth-service", "tender-service", "quotation-service"]
+  services = ["frontend", "auth-service", "tender-service", "quotation-service"]
 }
 
 # ---------------------------------------------------------------------------
