@@ -1,6 +1,6 @@
 image:
   repository: 935262984400.dkr.ecr.ap-south-1.amazonaws.com/tenderflow/frontend
-  tag: manual-1          # the pipeline will bump this later
+  tag: bcff89d          # the pipeline will bump this later
 
 port: 8080               # nginx-unprivileged listens on 8080 (see nginx.conf)
 
