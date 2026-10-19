@@ -1,220 +1,462 @@
-# TenderFlow on AWS — company-style platform, built from scratch
+<div align="center">
 
-> **For Claude Code:** this file is the handoff from a planning conversation. Read it fully before acting.
-> Some "done" items were reported by the user but not verified — run the checks in [Verify current state first](#verify-current-state-first) before changing anything.
+# TenderFlow Platform
 
-## Goal
+**A production-shaped GitOps platform on AWS, built from scratch with Terraform, EKS and Argo CD.**
 
-A personal, educational weekend project: rebuild the *shape* of a real company platform (AKS + Azure DevOps + ArgoCD GitOps) on **AWS**, using the user's own team project **TenderFlow** as the workload.
+A `git push` builds container images, commits the new image tag to git, and Argo CD rolls it out.<br/>
+The CI system never holds cluster credentials.
 
-**Ground rules**
+![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.10-7B42BC?logo=terraform&logoColor=white)
+![Amazon EKS](https://img.shields.io/badge/Amazon%20EKS-1.35-FF9900?logo=amazoneks&logoColor=white)
+![Argo CD](https://img.shields.io/badge/Argo%20CD-GitOps-EF7B4D?logo=argo&logoColor=white)
+![Helm](https://img.shields.io/badge/Helm-chart-0F1689?logo=helm&logoColor=white)
+![AWS CodePipeline](https://img.shields.io/badge/CI-CodePipeline%20%2B%20CodeBuild-232F3E?logo=amazonwebservices&logoColor=white)
 
-- **Nothing is copied from the user's employer.** No configs, repos, names, or secrets. Everything here is written from scratch.
-- **Cost discipline.** Personal AWS account. The platform stack is destroyed at the end of every session. Pin tool/chart versions that are at least ~2 weeks old.
-- **Ask before** running `terraform apply`, `terraform destroy`, `destroy.sh`, `bootstrap.sh`, `git push`, or any command that creates AWS resources or costs money.
-- **Never commit secrets.** Secrets live in SSM Parameter Store (`/tenderflow/*`) and reach pods via External Secrets.
-- **Mapping to learn:** AKS → EKS · ACR → ECR · Azure Repos → CodeCommit · Azure DevOps pipeline + release task → CodePipeline + CodeBuild (build → push → bump tag in infra repo) · ArgoCD syncing from an infra repo → same, on EKS.
+</div>
 
-## Environment
+---
 
-| Thing | Value |
+## Contents
+
+- [What this is](#what-this-is)
+- [Architecture](#architecture)
+- [How a change ships](#how-a-change-ships)
+- [Repository layout](#repository-layout)
+- [Infrastructure](#infrastructure)
+- [The Kubernetes layer](#the-kubernetes-layer)
+- [CI pipeline](#ci-pipeline)
+- [Security model](#security-model)
+- [Getting started](#getting-started)
+- [Daily workflow](#daily-workflow)
+- [Cost control](#cost-control)
+- [Problems solved along the way](#problems-solved-along-the-way)
+- [Roadmap](#roadmap)
+- [Credits](#credits)
+
+---
+
+## What this is
+
+**TenderFlow** is a tendering app: organisations publish tenders, traders submit quotations, and organisations award them. It consists of three Node.js microservices and a React frontend.
+
+This repository is the **platform** that runs it. It provisions the cloud infrastructure, packages the services, and delivers every change to Kubernetes through Git. It was built as a hands-on exercise in the patterns real platform teams use:
+
+| | |
 |---|---|
-| Region | `ap-south-1` (Mumbai) |
-| AWS auth | IAM Identity Center (SSO), CLI profile **`tenderflow`** → `export AWS_PROFILE=tenderflow` |
-| Machine | MacBook Air (Apple Silicon) → **always build images with `--platform linux/amd64`** |
-| Local infra folder | `~/Desktop/DevOps` (contains `terraform/bootstrap`, `terraform/platform`). Assumed to be the `tenderflow-infra` git repo — verify with `git remote -v` |
-| Kubernetes | EKS `1.35` (must stay in EKS *standard* support — extended support costs ~6×) |
-| Nodes | 2 × `t3.medium`, AL2023, managed node group |
+| **Infrastructure as Code** | Every AWS resource is Terraform, split into a permanent stack and a disposable one |
+| **GitOps** | The cluster's desired state lives in this repo. Argo CD makes the cluster match it |
+| **Pull-based delivery** | CI builds and commits; it never runs `kubectl` and has no cluster access |
+| **Secrets outside git** | Credentials live in SSM Parameter Store and are synced into pods by External Secrets |
+| **Least privilege** | Every component (CI, Argo CD, controllers) gets its own narrowly scoped IAM identity |
+| **Disposable environments** | The whole runtime is destroyed after each session and rebuilt from git in one command |
+
+---
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    dev([Developer]) -->|git push| src[("CodeCommit<br/>backend · frontend")]
+    src -->|push to main| eb[EventBridge]
+    eb -->|starts| cp[CodePipeline]
+    cp --> cb[CodeBuild]
+    cb -->|"① push image :sha"| ecr[("Amazon ECR")]
+    cb ==>|"② commit image.tag"| infra[("tenderflow-infra<br/>(this repo)")]
+
+    subgraph vpc["VPC · ap-south-1 · rebuilt every session"]
+        alb["ALB<br/>internet-facing"]
+        subgraph eks["EKS 1.35 · 2 × t3.medium"]
+            argo["Argo CD"]
+            eso["External Secrets"]
+            fe["frontend<br/>nginx :8080"]
+            auth["auth-service<br/>:4001"]
+            tender["tender-service<br/>:4002"]
+            quote["quotation-service<br/>:4003"]
+        end
+        docdb[("DocumentDB<br/>TLS")]
+        cache[("ElastiCache Valkey<br/>rediss://")]
+    end
+
+    infra -.->|"polled every ~3 min"| argo
+    argo -->|syncs Helm releases| fe & auth & tender & quote
+
+    users([Users]) --> alb
+    alb -->|"/"| fe
+    alb -->|"/auth"| auth
+    alb -->|"/tender"| tender
+    alb -->|"/quotation"| quote
+
+    auth & tender & quote --> docdb
+    tender --> cache
+    tender -->|award call| quote
+
+    ssm[("SSM Parameter Store<br/>/tenderflow/*")] --> eso
+    eso -->|"Secret: tenderflow-secrets"| auth & tender & quote
+    ecr -.->|nodes pull images| eks
 ```
- dev pushes ──► CodeCommit: tenderflow-backend ──► CodePipeline ──► CodeBuild ──► ECR (tenderflow/<svc>:<shortsha>)
-                CodeCommit: tenderflow-frontend ─► CodePipeline ──► CodeBuild ──┘        │
-                                                                                         ▼
-                                                    CodeBuild commits new tag ──► CodeCommit: tenderflow-infra
-                                                                                         │
-                                                              ArgoCD (on EKS) watches ◄──┘
-                                                                     │
-           ALB (AWS LB Controller) ──► /auth/*      → auth-service      :4001
-                                       /tenders/*   → tender-service    :4002
-                                       /quotation/* → quotation-service :4003
-                                       /            → frontend (nginx)  :80
-                                                                     │
-                      DocumentDB (Mongo-compatible, TLS) ◄───────────┤
-                      ElastiCache Redis ◄────────────────────────────┤
-                      SSM Parameter Store /tenderflow/* ──► External Secrets ──► Secret "tenderflow-secrets"
+
+**One ALB acts as the API gateway.** Path prefixes match each service's Express mount, so no gateway code is needed:
+
+| Path | Service | Port | Backed by |
+|---|---|---|---|
+| `/auth/*` | auth-service | 4001 | DocumentDB |
+| `/tender/*` | tender-service | 4002 | DocumentDB, Valkey cache, quotation-service |
+| `/quotation/*` | quotation-service | 4003 | DocumentDB |
+| `/*` | frontend (nginx) | 8080 | Static React build |
+
+The frontend is built with an empty `VITE_API_URL`, so the browser calls `/auth`, `/tender` and `/quotation` on the same origin. The ALB routes them, and no CORS is needed.
+
+---
+
+## How a change ships
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Developer
+    participant Src as CodeCommit (app repo)
+    participant CP as CodePipeline
+    participant CB as CodeBuild
+    participant ECR as Amazon ECR
+    participant Infra as tenderflow-infra
+    participant Argo as Argo CD
+    participant K8s as EKS
+
+    Dev->>Src: git push (main)
+    Src-->>CP: EventBridge: branch updated
+    CP->>CB: start build with COMMIT_ID
+    CB->>ECR: docker build + push :short-sha
+    CB->>Infra: commit image.tag = short-sha
+    Note over CB,Infra: CI stops here. No deploy stage, no cluster credentials.
+    Argo->>Infra: poll (every ~3 min)
+    Argo->>K8s: helm upgrade (rolling update)
+    K8s->>ECR: pull :short-sha
+    Note over K8s: readiness probe /readyz gates traffic to the new pod
 ```
 
-CodePipeline **never deploys to the cluster**. It stops at the tag bump; ArgoCD deploys (GitOps).
+- **Rollback is a `git revert`** of the `ci(...)` commit in this repo. Argo CD rolls the cluster back to the previous tag.
+- **Every deploy is auditable.** The infra repo's history records exactly which image ran in which environment, and when.
 
-## Repositories
+---
 
-| Repo | Where | Contents |
-|---|---|---|
-| `Hetosk1/tenderflow` | GitHub | Team monorepo, source of truth for app code. Teammates keep working here. Contains a legacy `backend-tenderflow/` folder — **ignore it, it is not deployed** (old pre-split version). |
-| `tenderflow-backend` | CodeCommit | The **contents of the `microservices/` folder** at repo root: `auth-service/`, `tender-service/`, `quotation-service/` |
-| `tenderflow-frontend` | CodeCommit | Contents of `tenderflow-pro/` (Vite app, served by nginx via `Dockerfile.prod`) |
-| `tenderflow-infra` | CodeCommit | Terraform + Helm chart + per-env values + ArgoCD apps (this repo) |
+## Repository layout
 
-Git → CodeCommit auth uses the AWS credential helper (no username/password). Per repo:
-
-```bash
-git config --local credential.helper ''
-git config --local --add credential.helper '!aws codecommit credential-helper --profile tenderflow $@'
-git config --local credential.UseHttpPath true
-```
-
-## Services (only 4 images — there is NO monolith backend)
-
-| Service | Port | Secrets (from `tenderflow-secrets`) | Plain env | Health route | Status |
-|---|---|---|---|---|---|
-| auth-service | 4001 | `MONGO_URI`, `JWT_SECRET` | `PORT` | `/heath` (typo in `server.js`) | values + ArgoCD app written |
-| tender-service | 4002 | `MONGO_URI`, `REDIS_URI`, `JWT_SECRET` | `PORT`, `QUOTATION_SERVICE_URL=http://quotation-service:4003` | **none — must add `GET /health`** | not started |
-| quotation-service | 4003 | `MONGO_URI`, `REDIS_URI`, `JWT_SECRET` | `PORT` | **none — must add `GET /health`** | not started |
-| frontend | 80 | — | — (Vite bakes API URL at build time → use relative paths) | `/` | not started; needs its own small nginx chart |
-
-Route prefixes already match each service's `app.use(...)` mount, so the ALB acts as the API gateway with no code changes.
-
-## Repo layout (target)
-
-```
+```text
 tenderflow-infra/
 ├── terraform/
-│   ├── bootstrap/        # PERMANENT, local state: S3 state bucket, 3 CodeCommit repos, ECR repos
-│   └── platform/         # DESTROYED EVERY SESSION, S3 backend: VPC, EKS, add-ons, DocumentDB, ElastiCache, SSM params
-│       ├── versions.tf   # aws ~> 6.28, helm ~> 3.2, S3 backend with use_lockfile, provider "helm" (v3 syntax: kubernetes = { exec = {...} })
-│       ├── main.tf       # VPC (2 AZ, single NAT) + EKS module v21 + EKS add-ons incl. aws-ebs-csi-driver (default gp3 SC)
-│       ├── addons.tf     # Pod Identity roles + Helm: aws-load-balancer-controller, external-secrets, argo-cd
-│       ├── destroy.sh    # USE INSTEAD OF `terraform destroy` (deletes ALBs/PVCs via k8s first)
-│       └── (user-added)  # DocumentDB, ElastiCache, SSM params — not reviewed yet, see Known issues
-├── charts/node-service/  # one reusable chart for the 3 Node services (Deployment + Service, probes, secretEnv, optional DocumentDB CA mount)
-├── envs/dev/<service>/values.yaml
-├── platform-config/dev/  # ExternalSecret: SSM → Secret "tenderflow-secrets" (MONGO_URI, REDIS_URI, JWT_SECRET)
-├── argocd/apps/          # child Applications (platform-config, auth-service, ...)
-└── bootstrap/            # run each session after apply: ClusterSecretStore, ArgoCD repo creds (ExternalSecret), DocumentDB CA ConfigMap, root app
+│   ├── bootstrap/            # PERMANENT · local state
+│   │   ├── main.tf           #   S3 state bucket, 3 CodeCommit repos, 4 ECR repos
+│   │   ├── pipeline.tf       #   CodePipeline ×2, CodeBuild ×2, IAM, EventBridge triggers
+│   │   ├── outputs.tf
+│   │   └── versions.tf
+│   └── platform/             # DISPOSABLE · S3 remote state with native locking
+│       ├── main.tf           #   VPC (2 AZ, single NAT) + EKS + managed add-ons
+│       ├── addons.tf         #   Pod Identity roles · LB Controller · External Secrets · Argo CD
+│       ├── data.tf           #   DocumentDB · ElastiCache Valkey · SSM parameters
+│       ├── destroy.sh        #   safe teardown (use instead of `terraform destroy`)
+│       ├── variables.tf · outputs.tf · versions.tf
+├── charts/
+│   └── node-service/         # one reusable Helm chart for every service
+├── envs/
+│   └── dev/<service>/values.yaml   # per-service config; CI bumps image.tag here
+├── platform-config/
+│   └── dev/                  # ExternalSecret + ALB Ingress (synced by Argo CD)
+├── argocd/
+│   └── apps/                 # child Applications (app-of-apps)
+└── bootstrap/                # run once per cluster build
+    ├── bootstrap.sh
+    ├── cluster-secret-store.yaml
+    ├── argocd-repo-secret.yaml
+    └── root-app.yaml
 ```
 
-## Where we've reached
+**Related repositories**
 
-**Phase 0: Account setup — done (reported)**
-SSO admin user, CLI profile `tenderflow`, root MFA, budget alert, tools installed (aws, terraform, kubectl, helm).
+| Repo | Contents | Pipeline |
+|---|---|---|
+| `tenderflow-infra` | This repo: the platform and the desired cluster state | None (Argo CD reads it) |
+| `tenderflow-backend` | `auth-service/`, `tender-service/`, `quotation-service/` + `buildspec.yml` | `tenderflow-backend` |
+| `tenderflow-frontend` | React + Vite app, `Dockerfile.prod` (nginx) + `buildspec.yml` | `tenderflow-frontend` |
 
-**Phase 1: Terraform foundation — done (reported)**
-- `bootstrap/` applied: S3 state bucket `tenderflow-tfstate-<account_id>`, CodeCommit repos `tenderflow-backend`, `tenderflow-frontend`, `tenderflow-infra` (all `prevent_destroy`), ECR repos `tenderflow/<svc>` (IMMUTABLE tags, scan on push, keep last 10).
-- `platform/` applied: VPC + EKS `tenderflow`.
+---
 
-**Phase 2a: Cluster add-ons — done (applied successfully after fixes)**
-- AWS Load Balancer Controller chart `3.5.0`, External Secrets chart `2.11.0`, Argo CD chart `10.9.2`, EBS CSI add-on with default gp3 StorageClass, all IAM via EKS Pod Identity (module `terraform-aws-modules/eks-pod-identity/aws` `2.9.0`).
-- Fixes already applied: removed `<...>` around chart repository URLs (copy-paste artifact); added `provider "helm"` block; added `depends_on = [helm_release.aws_lb_controller]` to external-secrets and argocd (LBC webhook race).
-- User **also added on their own**: DocumentDB, ElastiCache Redis, SSM params. Last `terraform output`:
-  - `docdb_endpoint = tenderflow.cluster-….ap-south-1.docdb.amazonaws.com`
-  - `redis_endpoint = master.tenderflow.….aps1.cache.amazonaws.com` (the `master.` prefix suggests in-transit TLS)
-  - `ssm_parameters = /tenderflow/mongo-uri, /tenderflow/redis-uri, /tenderflow/jwt-secret`
+## Infrastructure
 
-**Phase 2b: First app deploy (auth-service) — files generated, NOT confirmed applied**
-Generated as `phase2b.zip` (chart, `envs/dev/auth-service`, `platform-config/dev`, `argocd/apps`, `bootstrap/`). Unknown whether the user has: unzipped it into the repo, replaced `ACCOUNT_ID` in `envs/dev/auth-service/values.yaml`, created the ArgoCD CodeCommit IAM user + SSM creds, pushed the auth-service image, committed/pushed, or run `bootstrap.sh`.
+The Terraform is split by **lifetime**, so expensive compute can be destroyed daily while code, images and history survive.
 
-**Phase 3 (pipeline), Phase 4 (break it on purpose), stretch goals — not started.**
+### `terraform/bootstrap`: permanent
 
-## Verify current state first
-
-```bash
-export AWS_PROFILE=tenderflow
-aws sts get-caller-identity
-cd ~/Desktop/DevOps && git status && git remote -v && git log --oneline -5
-ls charts envs argocd bootstrap platform-config 2>/dev/null        # is phase2b in the repo?
-grep -rn 'ACCOUNT_ID' envs bootstrap terraform 2>/dev/null           # unreplaced placeholders
-grep -n '"backend"' terraform/bootstrap/main.tf                      # cleanup item below
-ls terraform/platform/ && grep -ln 'docdb\|elasticache' terraform/platform/*.tf
-aws ssm get-parameters-by-path --path /tenderflow --recursive --query 'Parameters[].Name'
-aws ecr describe-images --repository-name tenderflow/auth-service --query 'imageDetails[].imageTags' 2>/dev/null
-aws eks describe-cluster --name tenderflow --query cluster.status 2>/dev/null   # is the cluster up right now?
-```
-
-## Known issues / what needs fixing
-
-Ordered roughly by priority.
-
-1. **Remove `"backend"` from `local.services`** in `terraform/bootstrap/main.tf`. There is no monolith; this leaves an unused `tenderflow/backend` ECR repo. (Empty repo, safe to destroy via plan.)
-2. **Review the user-added DocumentDB / ElastiCache / SSM Terraform:**
-   - `skip_final_snapshot = true` on DocumentDB, otherwise `destroy.sh` fails.
-   - DocumentDB security group must allow **27017 from the EKS node security group** (`module.eks.node_security_group_id`); ElastiCache SG must allow **6379** likewise.
-   - `MONGO_URI` must be DocumentDB-compatible:
-     `mongodb://USER:PASS@<docdb_endpoint>:27017/tenderflow?tls=true&tlsCAFile=/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false`
-     (the chart mounts the CA at `/certs/global-bundle.pem` when `docdbCA: true`; `bootstrap.sh` creates the `docdb-ca` ConfigMap).
-   - If ElastiCache transit encryption is on, `REDIS_URI` must be `rediss://…` (plus auth token if configured).
-   - SSM params should be `SecureString`; values end up in Terraform state (S3, encrypted) — acceptable for this project.
-3. **Health endpoints:** add `GET /health` to tender-service and quotation-service (app code). auth-service uses `/heath`; the chart probe matches it — fix both together if renaming. App changes should also go back to the team's GitHub repo.
-4. **Pod density:** t3.medium allows 17 pods/node; system add-ons already use ~26 of 34. Before deploying all services, enable VPC CNI prefix delegation (vpc-cni add-on `configuration_values` with `ENABLE_PREFIX_DELEGATION=true`, `WARM_PREFIX_TARGET=1`; nodes must be replaced to pick up new max-pods) or move to larger instances.
-5. **Cosmetic:** `terraform/platform/outputs.tf` `argocd_ui` string contains `<https://localhost:8080>` brackets.
-6. **ArgoCD repo access (one-time, if not done):** IAM user `argocd-codecommit` with `codecommit:GitPull` on `tenderflow-infra` only, HTTPS Git service-specific credential, stored as SSM SecureStrings `/tenderflow/argocd/git-username` and `/tenderflow/argocd/git-password` (read by `bootstrap/argocd-repo-secret.yaml`). Ideally codify the IAM user in `bootstrap/` Terraform later.
-
-## Next steps
-
-- [ ] Finish Phase 2b for auth-service: verify → fix placeholders → push image (`docker buildx build --platform linux/amd64 -t <acct>.dkr.ecr.ap-south-1.amazonaws.com/tenderflow/auth-service:manual-1 --push .`) → commit/push infra → `./bootstrap/bootstrap.sh` → app Synced/Healthy, logs show "Connected to Database", `curl localhost:4001/heath` via port-forward works.
-- [ ] Prefix delegation (issue 4).
-- [ ] tender-service + quotation-service: `envs/dev/<svc>/values.yaml` + `argocd/apps/<svc>.yaml` (same chart, `docdbCA: true`, secretEnv per table above).
-- [ ] Frontend: small nginx chart (or generalize `node-service` → `web-service`), port 80, health `/`.
-- [ ] Ingress: one ALB, `ingressClassName: alb`, `alb.ingress.kubernetes.io/scheme: internet-facing`, `target-type: ip`, path rules per routing table, `/` last. Put it in an ArgoCD-managed app.
-- [ ] **Phase 3 pipeline (Terraform, in `bootstrap/` so it survives teardown):**
-  - Two CodeBuild projects (privileged mode on) + two CodePipelines (Source: CodeCommit; Build: CodeBuild). No deploy stage.
-  - CodeBuild role: ECR push on `tenderflow/*`, `codecommit:GitPull`/`GitPush` on `tenderflow-infra` only, CloudWatch Logs.
-  - `buildspec.yml` per repo (a draft exists from the conversation): ECR login, build with tag = short commit SHA, push, then clone `tenderflow-infra`, `yq -i '.image.tag = "<sha>"' envs/dev/<svc>/values.yaml`, commit, **`git pull --rebase` then push** (two pipelines can race), and **guard `post_build` with `CODEBUILD_BUILD_SUCCEEDING`**. Backend repo build contexts are `auth-service/`, `tender-service/`, `quotation-service/` (repo root = microservices folder). Frontend runs `npm ci && npm run build` before `docker build -f Dockerfile.prod`.
-  - Consider ECR pull-through cache for Docker Hub base images (rate limits from shared CodeBuild IPs).
-- [ ] Phase 4, break it on purpose: bad image → readiness blocks rollout → `git revert` in infra repo; delete pod / drain node; `kubectl edit` → ArgoCD self-heal reverts.
-- [ ] Stretch: `prod` env + manual approval stage in CodePipeline; Prometheus/Grafana; HPA on tender-service; README architecture diagram for portfolio.
-
-## Session runbook
-
-**Start**
-
-```bash
-aws sso login --profile tenderflow
-export AWS_PROFILE=tenderflow
-cd ~/Desktop/DevOps/terraform/platform
-terraform apply
-aws eks update-kubeconfig --region ap-south-1 --name tenderflow   # endpoint changes every rebuild
-cd ~/Desktop/DevOps && ./bootstrap/bootstrap.sh
-kubectl get applications -n argocd
-```
-
-**ArgoCD UI**
-
-```bash
-kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d
-kubectl -n argocd port-forward svc/argocd-server 8080:443    # https://localhost:8080, user admin
-```
-
-**End (every session)**
-
-```bash
-cd ~/Desktop/DevOps/terraform/platform && ./destroy.sh        # NOT plain terraform destroy
-```
-
-`bootstrap/` Terraform (state bucket, CodeCommit, ECR) is never destroyed; keep its local `terraform.tfstate` safe (gitignored).
-
-## Gotchas already hit (don't repeat)
-
-- Copying from rendered markdown wrapped URLs in `<...>` → Helm "invalid chart URL format".
-- Helm provider v3 syntax is `kubernetes = { ... exec = { ... } }` (with `=`), not v2 block syntax.
-- LBC webhook race: anything creating Services must `depends_on` the LBC Helm release.
-- Failed Helm release blocks re-create ("cannot re-use a name") → `helm uninstall <name> -n <ns>` then apply.
-- Stale kubeconfig after rebuild → "no such host" → `aws eks update-kubeconfig`.
-- macOS Keychain intercepts CodeCommit HTTPS → 403; clear credential helper per repo (see Repositories).
-- `post_build` in CodeBuild runs even when `build` fails.
-
-## Pinned versions
-
-| Component | Version |
+| Resource | Notes |
 |---|---|
-| Terraform | ≥ 1.10 (S3 native locking) |
-| AWS provider | ~> 6.28 |
-| Helm provider | ~> 3.2 |
-| `terraform-aws-modules/vpc/aws` | ~> 6.0 |
-| `terraform-aws-modules/eks/aws` | ~> 21.0 (inputs: `name`, `kubernetes_version`, `endpoint_public_access`, `enable_cluster_creator_admin_permissions`, `addons`) |
-| `terraform-aws-modules/eks-pod-identity/aws` | 2.9.0 |
-| aws-load-balancer-controller chart | 3.5.0 |
-| external-secrets chart | 2.11.0 (API `external-secrets.io/v1`) |
-| argo-cd chart | 10.9.2 |
-| EKS Kubernetes | 1.35 |
+| S3 bucket `tenderflow-tfstate-<account-id>` | Versioned, encrypted, public access blocked, `prevent_destroy` |
+| CodeCommit × 3 | `tenderflow-backend`, `tenderflow-frontend`, `tenderflow-infra` (`prevent_destroy`) |
+| ECR × 4 | `tenderflow/<service>`: **immutable tags**, scan on push, keeps the last 10 images |
+| CodePipeline × 2 (V2) | Source → Build, `QUEUED` execution mode, **no deploy stage** |
+| CodeBuild × 2 | AL2023 x86_64 image, privileged mode for Docker, 7-day log retention |
+| EventBridge rules × 2 | Start the pipeline the moment `main` changes (no polling) |
+| IAM roles × 3 | CodeBuild, CodePipeline, EventBridge, each scoped to exactly what it needs |
+
+### `terraform/platform`: rebuilt every session
+
+| Resource | Notes |
+|---|---|
+| VPC | 2 AZs, public + private subnets, **one** NAT gateway, subnets tagged for ALB discovery |
+| EKS 1.35 | Managed node group: 2 × `t3.medium` (AL2023). Kept on a version in standard support |
+| EKS add-ons | VPC CNI, CoreDNS, kube-proxy, Pod Identity Agent, EBS CSI (default gp3 StorageClass) |
+| AWS Load Balancer Controller | Helm, Pod Identity. Turns the Ingress into an ALB |
+| External Secrets Operator | Helm, Pod Identity. Read-only on `/tenderflow/*` in SSM |
+| Argo CD | Helm. Reached by `kubectl port-forward` (no public endpoint) |
+| DocumentDB 8.0 | TLS enforced, encrypted, `skip_final_snapshot` for clean teardown |
+| ElastiCache Valkey | At-rest and in-transit encryption (`rediss://`) |
+| SSM parameters | `mongo-uri`, `redis-uri`, `jwt-secret` as `SecureString`, generated by Terraform |
+
+> **Why Terraform installs Argo CD.** Argo CD has to exist before it can deploy anything, so the platform tools (Argo CD, LB Controller, External Secrets) come from Terraform and everything app-related comes from Argo CD.
+
+---
+
+## The Kubernetes layer
+
+### App of apps
+
+`bootstrap/root-app.yaml` creates a single **root** Application that watches `argocd/apps/`. Every file there is a child Application:
+
+```text
+root  ──►  platform-config   (ExternalSecret + Ingress)
+      ──►  auth-service      ┐
+      ──►  tender-service    │  charts/node-service
+      ──►  quotation-service │  + envs/dev/<svc>/values.yaml
+      ──►  frontend          ┘
+```
+
+All apps use **automated sync with `prune` and `selfHeal`**. A manual `kubectl edit` is reverted, and anything deleted from git is deleted from the cluster.
+
+### One chart, four services
+
+`charts/node-service` is a small, reusable chart (Deployment + Service). Each service only declares what differs:
+
+```yaml
+# envs/dev/tender-service/values.yaml
+image:
+  repository: <account-id>.dkr.ecr.ap-south-1.amazonaws.com/tenderflow/tender-service
+  tag: 012315c          # bumped by CI
+
+port: 4002
+
+env:
+  QUOTATION_SERVICE_URL: http://quotation-service:4003
+
+secretEnv:              # keys pulled from the shared Secret
+  - MONGO_URI
+  - REDIS_URI
+  - JWT_SECRET
+```
+
+| Value | Default | Purpose |
+|---|---|---|
+| `livenessPath` | `/healthz` | Process is alive |
+| `readinessPath` | `/readyz` | Database connected. Gates traffic during rollouts |
+| `secretEnv` | `[]` | Keys injected from `tenderflow-secrets` |
+| `env` | `{}` | Plain environment variables |
+| `resources` | 50m CPU / 128–256Mi | Requests and limits |
+
+### Secrets flow
+
+```text
+Terraform ──► SSM Parameter Store ──► External Secrets ──► Secret "tenderflow-secrets" ──► pod env
+              (SecureString)          (Pod Identity,        (refreshed hourly)
+                                       read-only /tenderflow/*)
+```
+
+Argo CD's own Git credentials follow the same path: they are stored in SSM and materialised as a repository Secret by an `ExternalSecret`, so they survive every cluster rebuild.
+
+---
+
+## CI pipeline
+
+Each app repo has a `buildspec.yml`. Both follow the same three phases:
+
+| Phase | What happens |
+|---|---|
+| **pre_build** | Validate `COMMIT_ID` (passed in from the pipeline's source variables), log in to ECR |
+| **build** | `TAG = first 7 chars of the commit`. For each service: **skip if the tag already exists** (tags are immutable), otherwise `docker build` and `docker push` |
+| **post_build** | **Guarded by `CODEBUILD_BUILD_SUCCEEDING`**: clone `tenderflow-infra`, set the tag line in each `values.yaml`, commit as `tenderflow-ci`, then `git pull --rebase && git push` with retries |
+
+Design details that matter:
+
+- **The source zip has no `.git` directory.** The commit SHA is passed explicitly as `#{SourceVariables.CommitId}`.
+- **`post_build` runs even when `build` fails.** The guard stops CI from ever pointing the cluster at an image that was never pushed.
+- **Two pipelines can push to the infra repo at once.** The rebase-and-retry loop makes concurrent backend and frontend builds safe.
+- **The tag bump is a targeted `sed`**, not a YAML re-serialiser. Every CI commit is a clean one-line diff.
+- **Every script block uses `set -euo pipefail`.** One failed service build fails the whole job instead of being skipped silently.
+- **Re-running a pipeline is a no-op.** An existing tag is skipped and an unchanged values file means nothing to commit.
+
+---
+
+## Security model
+
+| Principal | Can do | Cannot do |
+|---|---|---|
+| **CodeBuild role** | Push to the 4 ECR repos · `GitPull`/`GitPush` on `tenderflow-infra` · write its own logs | Touch the cluster, read app source repos directly, read secrets |
+| **CodePipeline role** | Read the 2 app repos · start the 2 builds · use the artifact bucket | Anything else |
+| **Argo CD** (`argocd-codecommit` user) | `GitPull` on `tenderflow-infra` only | Push, or read any other repo |
+| **External Secrets** (Pod Identity) | Read `/tenderflow/*` in SSM | Write anything |
+| **LB Controller / EBS CSI** (Pod Identity) | Their AWS-managed policies | — |
+
+Further measures:
+
+- **No long-lived cluster credentials anywhere in CI.** Production changes only through a reviewed git commit.
+- **No secrets in git.** `.gitignore` blocks state files, `.tfvars`, `.env*`, keys and kubeconfigs.
+- **Immutable, scanned images**, tagged by commit, so every running pod traces back to a commit.
+- **Non-root containers.** The Node images run as `node` and the frontend uses `nginx-unprivileged`.
+- **TLS to every data store.** DocumentDB uses a CA bundle baked into the images, and Valkey uses `rediss://`.
+
+---
+
+## Getting started
+
+### Prerequisites
+
+- AWS account with IAM Identity Center (SSO) and a CLI profile
+- Terraform ≥ 1.10, AWS CLI v2, kubectl, Helm, Docker (with `buildx` on Apple Silicon)
+
+```bash
+export AWS_PROFILE=<your-profile>
+```
+
+### 1. Bootstrap (once)
+
+```bash
+cd terraform/bootstrap
+terraform init && terraform apply
+```
+
+Then set the state bucket name from the `tfstate_bucket` output in `terraform/platform/versions.tf`, and push the app code to the `tenderflow-backend` and `tenderflow-frontend` CodeCommit repos. The first push builds the first images.
+
+### 2. Give Argo CD read access to this repo (once)
+
+```bash
+aws iam create-user --user-name argocd-codecommit
+aws iam put-user-policy --user-name argocd-codecommit --policy-name infra-read-only \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"codecommit:GitPull","Resource":"arn:aws:codecommit:ap-south-1:<account-id>:tenderflow-infra"}]}'
+
+# Create the HTTPS Git credential and store it straight in SSM. It is never printed.
+read -r GIT_USER GIT_PASS < <(aws iam create-service-specific-credential \
+  --user-name argocd-codecommit --service-name codecommit.amazonaws.com \
+  --query 'ServiceSpecificCredential.[ServiceUserName,ServicePassword]' --output text)
+aws ssm put-parameter --name /tenderflow/argocd/git-username --type SecureString --value "$GIT_USER"
+aws ssm put-parameter --name /tenderflow/argocd/git-password --type SecureString --value "$GIT_PASS"
+unset GIT_USER GIT_PASS
+```
+
+### 3. Bring the platform up (each session)
+
+```bash
+cd terraform/platform
+terraform init && terraform apply                              # ~20 min (EKS + DocumentDB)
+aws eks update-kubeconfig --region ap-south-1 --name tenderflow
+cd ../.. && ./bootstrap/bootstrap.sh                           # Argo CD takes over from here
+kubectl get applications -n argocd -w
+```
+
+`bootstrap.sh` applies the SSM `ClusterSecretStore` and Argo CD's repo credential, creates the `tenderflow` namespace, waits for the credential to sync, and applies the root app.
+
+### 4. Open it
+
+```bash
+# The app
+kubectl -n tenderflow get ingress tenderflow       # ADDRESS = the ALB hostname
+
+# Argo CD UI at https://localhost:8080 (user: admin)
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl -n argocd port-forward svc/argocd-server 8080:443
+```
+
+### 5. Tear it down (end of every session)
+
+```bash
+cd terraform/platform && ./destroy.sh
+```
+
+> **Use `destroy.sh`, not `terraform destroy`.** The ALB and EBS volumes are created by controllers inside the cluster, so Terraform doesn't know about them. The script deletes them through Kubernetes first. Otherwise the VPC deletion hangs and orphaned resources keep billing.
+
+---
+
+## Daily workflow
+
+| I want to… | Do this |
+|---|---|
+| Deploy a change | Push to `main` in the app repo. That's all |
+| See what's deployed | `git log` in this repo, or the Argo CD UI |
+| Roll back | `git revert <ci-commit>` here and push |
+| Retry a failed build | CodePipeline console → **Release change** |
+| Deploy faster than the 3-minute poll | Argo CD UI → **Refresh** on the app |
+| Change config (env vars, resources) | Edit `envs/dev/<svc>/values.yaml`, then commit and push |
+| Edit this repo | **`git pull` first**, because CI commits here too |
+
+---
+
+## Cost control
+
+Built on a personal account, so cost was a design constraint:
+
+- **Two stacks by lifetime.** Only cheap, idle-friendly resources (S3, ECR, CodeCommit, pipelines) stay up permanently.
+- **Destroy after every session.** EKS, NAT, DocumentDB, ElastiCache and the ALB bill by the hour, so they only exist while in use.
+- **A single NAT gateway** instead of one per AZ.
+- **Small instance classes**: `t3.medium` nodes, `db.t4g.medium`, `cache.t4g.micro`.
+- **EKS kept in standard support.** Extended support costs about 6× more for the control plane.
+- **Housekeeping:** ECR keeps 10 images per repo, build logs expire after 7 days, pipeline artifacts after 7 days.
+- **An AWS Budgets alert** on the account as a safety net.
+
+---
+
+## Problems solved along the way
+
+Real issues hit while building this, and their fixes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pods in `CrashLoopBackOff` with `Unsupported mechanism [ -301 ]` | MongoDB driver 7.x defaults to SCRAM-SHA-256, which DocumentDB rejects | `authMechanism=SCRAM-SHA-1` in the connection string, verified first with a throwaway pod |
+| First pipeline run: `not authorized to perform codecommit:GetBranch` | A pipeline starts the moment it's created, before its IAM policy finished attaching | `depends_on` the role policy |
+| Probes silently ignored | Values keys (`readinessProbe:`) the chart never reads | Chart exposes `livenessPath` / `readinessPath`; values must match the chart's keys |
+| `no such host` from kubectl | The EKS endpoint changes on every rebuild | `aws eks update-kubeconfig` after each apply |
+| Services or Argo CD failing to install | LB Controller webhook not ready yet | `depends_on` the controller's Helm release |
+| Helm "invalid chart URL" | Markdown-wrapped `<https://…>` pasted into Terraform | Plain URLs |
+| CI commits reformatting YAML | `yq` normalises whitespace and comments | Targeted `sed` plus a verification `grep` |
+| "Pipeline is green but pods didn't change" | Argo CD polls git every ~3 min (CodeCommit can't send it webhooks) | Expected; use **Refresh** for instant sync |
+
+---
+
+## Roadmap
+
+- [ ] VPC CNI prefix delegation (t3.medium caps out at 17 pods per node)
+- [ ] `prod` environment with a manual approval stage
+- [ ] HTTPS on the ALB (Route 53 + ACM)
+- [ ] Prometheus + Grafana, and an HPA on tender-service
+- [ ] ECR pull-through cache for Docker Hub base images
+- [ ] Path-filtered pipeline triggers (skip builds for docs-only changes)
+- [ ] Argo CD managing its own Helm release
+- [ ] Codify the `argocd-codecommit` IAM user in Terraform
+
+---
+
+## Screenshots
+
+| Argo CD: app of apps | Argo CD: all apps Synced and Healthy |
+|---|---|
+| ![Argo CD app-of-apps tree](docs/images/argocd-tree.png) | ![Argo CD applications](docs/images/argocd-apps.png) |
+
+| CodePipeline: triggered by push | ECR: immutable SHA tags |
+|---|---|
+| ![CodePipeline execution](docs/images/codepipeline.png) | ![ECR images](docs/images/ecr.png) |
+
+![TenderFlow running behind the ALB](docs/images/app.png)
+
+---
+
+## Credits
+
+- **Platform** (this repo: Terraform, Helm, Argo CD, CI/CD): Het Jasani
+- **Application** (TenderFlow services and frontend): the TenderFlow team
+
+Built as a personal learning project. No configuration, code or secrets were taken from any employer.
