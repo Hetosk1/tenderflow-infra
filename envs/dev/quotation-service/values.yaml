@@ -1,6 +1,6 @@
 image:
   repository: 935262984400.dkr.ecr.ap-south-1.amazonaws.com/tenderflow/quotation-service
-  tag: manual-1          # the pipeline will bump this later
+  tag: 012315c          # the pipeline will bump this later
 
 port: 4003
 
